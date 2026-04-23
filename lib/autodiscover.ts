@@ -1,15 +1,23 @@
 import { promises as dns } from "dns";
 
+export type TlsMode = "implicit" | "starttls" | "plain";
+
 export interface MailHost {
   host: string;
   port: number;
-  secure: boolean; // true = implicit TLS, false = STARTTLS or plain
+  secure: boolean; // kept for back-compat; true iff tlsMode === "implicit"
+  tlsMode: TlsMode;
 }
 
 export interface MailConfig {
   imap: MailHost[];
+  pop3: MailHost[];
   smtp: MailHost[];
   source: string;
+}
+
+function makeHost(host: string, port: number, tlsMode: TlsMode): MailHost {
+  return { host, port, tlsMode, secure: tlsMode === "implicit" };
 }
 
 // In-process cache keyed by domain.
@@ -33,8 +41,16 @@ async function fetchWithTimeout(url: string, ms = 4000): Promise<Response | null
   }
 }
 
+function socketTypeToTls(sock: string): TlsMode {
+  const s = sock.toUpperCase();
+  if (s === "SSL") return "implicit";
+  if (s === "STARTTLS") return "starttls";
+  return "plain";
+}
+
 function parseAutoconfig(xml: string): MailConfig | null {
   const imap: MailHost[] = [];
+  const pop3: MailHost[] = [];
   const smtp: MailHost[] = [];
   const serverRe = /<incomingServer\b[^>]*type="(imap|pop3)"[^>]*>([\s\S]*?)<\/incomingServer>|<outgoingServer\b[^>]*type="smtp"[^>]*>([\s\S]*?)<\/outgoingServer>/gi;
   let m: RegExpExecArray | null;
@@ -43,15 +59,15 @@ function parseAutoconfig(xml: string): MailConfig | null {
     const type = m[1] || "smtp";
     const host = (body.match(/<hostname>([^<]+)<\/hostname>/i) || [])[1];
     const port = parseInt((body.match(/<port>([^<]+)<\/port>/i) || [])[1] || "0", 10);
-    const sock = ((body.match(/<socketType>([^<]+)<\/socketType>/i) || [])[1] || "").toUpperCase();
+    const sock = ((body.match(/<socketType>([^<]+)<\/socketType>/i) || [])[1] || "");
     if (!host || !port) continue;
-    const secure = sock === "SSL";
-    const entry = { host, port, secure };
+    const entry = makeHost(host, port, socketTypeToTls(sock));
     if (type === "imap") imap.push(entry);
+    else if (type === "pop3") pop3.push(entry);
     else if (type === "smtp") smtp.push(entry);
   }
-  if (!imap.length && !smtp.length) return null;
-  return { imap, smtp, source: "autoconfig" };
+  if (!imap.length && !pop3.length && !smtp.length) return null;
+  return { imap, pop3, smtp, source: "autoconfig" };
 }
 
 async function tryThunderbirdAutoconfig(domain: string): Promise<MailConfig | null> {
@@ -75,86 +91,144 @@ async function tryMx(domain: string): Promise<MailConfig | null> {
     if (!mx.length) return null;
     mx.sort((a, b) => a.priority - b.priority);
     const base = mx[0].exchange.replace(/\.$/, "");
-    // Use the MX base domain to guess common names.
     const parts = base.split(".");
     const apex = parts.slice(-2).join(".");
     const candidates = new Set([base, `imap.${apex}`, `mail.${apex}`, apex]);
-    const imap: MailHost[] = [];
-    const smtp: MailHost[] = [];
-    for (const host of candidates) {
-      imap.push({ host, port: 993, secure: true });
-      smtp.push({ host, port: 465, secure: true });
-      smtp.push({ host, port: 587, secure: false });
-    }
-    return { imap, smtp, source: "mx" };
+    return buildCandidates([...candidates], "mx");
   } catch {
     return null;
   }
 }
 
-function guessCommon(domain: string): MailConfig {
-  const imap: MailHost[] = [
-    { host: `imap.${domain}`, port: 993, secure: true },
-    { host: `mail.${domain}`, port: 993, secure: true },
-    { host: domain, port: 993, secure: true },
+async function trySrv(domain: string): Promise<Partial<MailConfig> | null> {
+  const out: Partial<MailConfig> = { imap: [], pop3: [], smtp: [], source: "srv" };
+  const records: Array<[string, "imap" | "pop3" | "smtp", TlsMode]> = [
+    [`_imaps._tcp.${domain}`, "imap", "implicit"],
+    [`_imap._tcp.${domain}`, "imap", "starttls"],
+    [`_pop3s._tcp.${domain}`, "pop3", "implicit"],
+    [`_pop3._tcp.${domain}`, "pop3", "starttls"],
+    [`_submissions._tcp.${domain}`, "smtp", "implicit"],
+    [`_submission._tcp.${domain}`, "smtp", "starttls"],
   ];
-  const smtp: MailHost[] = [
-    { host: `smtp.${domain}`, port: 465, secure: true },
-    { host: `smtp.${domain}`, port: 587, secure: false },
-    { host: `mail.${domain}`, port: 465, secure: true },
-    { host: `mail.${domain}`, port: 587, secure: false },
-  ];
-  return { imap, smtp, source: "guess" };
+  let found = false;
+  await Promise.all(
+    records.map(async ([rec, proto, tls]) => {
+      try {
+        const r = await dns.resolveSrv(rec);
+        for (const e of r) {
+          const h = e.name.replace(/\.$/, "");
+          (out as any)[proto].push(makeHost(h, e.port, tls));
+          found = true;
+        }
+      } catch {
+        // ignore
+      }
+    }),
+  );
+  return found ? out : null;
 }
 
-// Known providers — saves autodiscovery round trips for common free mail hosts.
+function buildCandidates(hosts: string[], source: string): MailConfig {
+  const imap: MailHost[] = [];
+  const pop3: MailHost[] = [];
+  const smtp: MailHost[] = [];
+  for (const h of hosts) {
+    imap.push(makeHost(h, 993, "implicit"));
+    imap.push(makeHost(h, 143, "starttls"));
+    pop3.push(makeHost(h, 995, "implicit"));
+    pop3.push(makeHost(h, 110, "starttls"));
+    smtp.push(makeHost(h, 465, "implicit"));
+    smtp.push(makeHost(h, 587, "starttls"));
+    smtp.push(makeHost(h, 25, "starttls"));
+  }
+  return { imap, pop3, smtp, source };
+}
+
+function guessCommon(domain: string): MailConfig {
+  return buildCandidates([`imap.${domain}`, `mail.${domain}`, `pop.${domain}`, `smtp.${domain}`, domain], "guess");
+}
+
 const KNOWN: Record<string, MailConfig> = {
   "gmail.com": {
-    imap: [{ host: "imap.gmail.com", port: 993, secure: true }],
-    smtp: [{ host: "smtp.gmail.com", port: 465, secure: true }],
+    imap: [makeHost("imap.gmail.com", 993, "implicit")],
+    pop3: [makeHost("pop.gmail.com", 995, "implicit")],
+    smtp: [makeHost("smtp.gmail.com", 465, "implicit"), makeHost("smtp.gmail.com", 587, "starttls")],
     source: "known",
   },
   "googlemail.com": {
-    imap: [{ host: "imap.gmail.com", port: 993, secure: true }],
-    smtp: [{ host: "smtp.gmail.com", port: 465, secure: true }],
+    imap: [makeHost("imap.gmail.com", 993, "implicit")],
+    pop3: [makeHost("pop.gmail.com", 995, "implicit")],
+    smtp: [makeHost("smtp.gmail.com", 465, "implicit"), makeHost("smtp.gmail.com", 587, "starttls")],
     source: "known",
   },
   "outlook.com": {
-    imap: [{ host: "outlook.office365.com", port: 993, secure: true }],
-    smtp: [{ host: "smtp.office365.com", port: 587, secure: false }],
+    imap: [makeHost("outlook.office365.com", 993, "implicit")],
+    pop3: [makeHost("outlook.office365.com", 995, "implicit")],
+    smtp: [makeHost("smtp.office365.com", 587, "starttls")],
     source: "known",
   },
   "hotmail.com": {
-    imap: [{ host: "outlook.office365.com", port: 993, secure: true }],
-    smtp: [{ host: "smtp.office365.com", port: 587, secure: false }],
+    imap: [makeHost("outlook.office365.com", 993, "implicit")],
+    pop3: [makeHost("outlook.office365.com", 995, "implicit")],
+    smtp: [makeHost("smtp.office365.com", 587, "starttls")],
     source: "known",
   },
   "live.com": {
-    imap: [{ host: "outlook.office365.com", port: 993, secure: true }],
-    smtp: [{ host: "smtp.office365.com", port: 587, secure: false }],
+    imap: [makeHost("outlook.office365.com", 993, "implicit")],
+    pop3: [makeHost("outlook.office365.com", 995, "implicit")],
+    smtp: [makeHost("smtp.office365.com", 587, "starttls")],
     source: "known",
   },
   "yahoo.com": {
-    imap: [{ host: "imap.mail.yahoo.com", port: 993, secure: true }],
-    smtp: [{ host: "smtp.mail.yahoo.com", port: 465, secure: true }],
+    imap: [makeHost("imap.mail.yahoo.com", 993, "implicit")],
+    pop3: [makeHost("pop.mail.yahoo.com", 995, "implicit")],
+    smtp: [makeHost("smtp.mail.yahoo.com", 465, "implicit")],
     source: "known",
   },
   "aol.com": {
-    imap: [{ host: "imap.aol.com", port: 993, secure: true }],
-    smtp: [{ host: "smtp.aol.com", port: 465, secure: true }],
+    imap: [makeHost("imap.aol.com", 993, "implicit")],
+    pop3: [makeHost("pop.aol.com", 995, "implicit")],
+    smtp: [makeHost("smtp.aol.com", 465, "implicit")],
     source: "known",
   },
   "icloud.com": {
-    imap: [{ host: "imap.mail.me.com", port: 993, secure: true }],
-    smtp: [{ host: "smtp.mail.me.com", port: 587, secure: false }],
+    imap: [makeHost("imap.mail.me.com", 993, "implicit")],
+    pop3: [],
+    smtp: [makeHost("smtp.mail.me.com", 587, "starttls")],
     source: "known",
   },
   "me.com": {
-    imap: [{ host: "imap.mail.me.com", port: 993, secure: true }],
-    smtp: [{ host: "smtp.mail.me.com", port: 587, secure: false }],
+    imap: [makeHost("imap.mail.me.com", 993, "implicit")],
+    pop3: [],
+    smtp: [makeHost("smtp.mail.me.com", 587, "starttls")],
     source: "known",
   },
 };
+
+function dedupe(list: MailHost[]): MailHost[] {
+  const seen = new Set<string>();
+  return list.filter((h) => {
+    const k = `${h.host}:${h.port}:${h.tlsMode}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+function merge(...configs: Array<Partial<MailConfig> | null | undefined>): MailConfig {
+  const imap: MailHost[] = [];
+  const pop3: MailHost[] = [];
+  const smtp: MailHost[] = [];
+  let source = "guess";
+  for (const c of configs) {
+    if (!c) continue;
+    if (c.imap) imap.push(...c.imap);
+    if (c.pop3) pop3.push(...c.pop3);
+    if (c.smtp) smtp.push(...c.smtp);
+    if (c.source) source = c.source;
+  }
+  return { imap: dedupe(imap), pop3: dedupe(pop3), smtp: dedupe(smtp), source };
+}
 
 export async function discover(email: string): Promise<MailConfig> {
   const domain = domainOf(email);
@@ -168,28 +242,16 @@ export async function discover(email: string): Promise<MailConfig> {
     return KNOWN[domain];
   }
 
-  const auto = await tryThunderbirdAutoconfig(domain);
+  const [auto, srv, mx] = await Promise.all([tryThunderbirdAutoconfig(domain), trySrv(domain), tryMx(domain)]);
   if (auto) {
-    cache.set(domain, { config: auto, at: now });
-    return auto;
+    const merged = merge(auto, srv, mx, guessCommon(domain));
+    merged.source = "autoconfig";
+    cache.set(domain, { config: merged, at: now });
+    return merged;
   }
 
-  const mx = await tryMx(domain);
   const guess = guessCommon(domain);
-  const merged: MailConfig = mx
-    ? { imap: [...mx.imap, ...guess.imap], smtp: [...mx.smtp, ...guess.smtp], source: mx.source }
-    : guess;
-
-  // Dedupe.
-  const seen = new Set<string>();
-  const dedupe = (list: MailHost[]) =>
-    list.filter((h) => {
-      const k = `${h.host}:${h.port}:${h.secure}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    });
-  const final: MailConfig = { imap: dedupe(merged.imap), smtp: dedupe(merged.smtp), source: merged.source };
+  const final = merge(srv, mx, guess);
   cache.set(domain, { config: final, at: now });
   return final;
 }

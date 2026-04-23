@@ -1,13 +1,14 @@
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import type { MailHost } from "./autodiscover";
+import { categorize, isDefinitive, type CategorizedError } from "./errors";
 
 export interface ImapResult {
   ok: boolean;
   host?: string;
   port?: number;
-  secure?: boolean;
-  error?: string;
+  tlsMode?: string;
+  error?: CategorizedError;
 }
 
 export interface Contact {
@@ -38,12 +39,13 @@ async function open(email: string, password: string, h: MailHost, timeoutMs: num
   const client = new ImapFlow({
     host: h.host,
     port: h.port,
-    secure: h.secure,
+    secure: h.tlsMode === "implicit",
+    disableAutoEnable: h.tlsMode === "plain",
     auth: { user: email, pass: password },
     logger: silentLogger(),
-    tls: { rejectUnauthorized: false },
+    tls: { rejectUnauthorized: false, minVersion: "TLSv1" },
     socketTimeout: timeoutMs,
-  });
+  } as any);
   await client.connect();
   return client;
 }
@@ -54,17 +56,17 @@ export async function verifyImap(
   hosts: MailHost[],
   timeoutMs = 8000,
 ): Promise<ImapResult> {
-  let lastErr = "no hosts";
+  let lastErr: CategorizedError = categorize("no hosts");
   for (const h of hosts) {
     try {
       const client = await open(email, password, h, timeoutMs);
       await client.logout().catch(() => {});
-      return { ok: true, host: h.host, port: h.port, secure: h.secure };
+      return { ok: true, host: h.host, port: h.port, tlsMode: h.tlsMode };
     } catch (e: any) {
-      const msg = String(e?.message || e);
-      lastErr = msg;
-      if (/auth|invalid credentials|login|NO|BAD/i.test(msg) && !/timeout|ENOTFOUND|ECONN/i.test(msg)) {
-        return { ok: false, host: h.host, port: h.port, secure: h.secure, error: msg };
+      const cat = categorize(e);
+      lastErr = cat;
+      if (isDefinitive(cat.category)) {
+        return { ok: false, host: h.host, port: h.port, tlsMode: h.tlsMode, error: cat };
       }
     }
   }
@@ -104,7 +106,7 @@ export async function extractContacts(
 
   let client: ImapFlow | null = null;
   let chosen: MailHost | null = null;
-  let lastErr = "no hosts";
+  let lastErr: CategorizedError = categorize("no hosts");
 
   for (const h of hosts) {
     try {
@@ -112,11 +114,11 @@ export async function extractContacts(
       chosen = h;
       break;
     } catch (e: any) {
-      lastErr = String(e?.message || e);
+      lastErr = categorize(e);
     }
   }
   if (!client || !chosen) {
-    return { ok: false, contacts: [], addresses: [], folders: [], messagesScanned: 0, error: lastErr };
+    return { ok: false, contacts: [], addresses: [], folders: [], messagesScanned: 0, error: lastErr.message };
   }
 
   const contacts = new Map<string, Contact>();
@@ -209,7 +211,7 @@ export async function extractContacts(
       }
     }
   } catch (e: any) {
-    lastErr = String(e?.message || e);
+    lastErr = categorize(e);
   } finally {
     await client.logout().catch(() => {});
   }
