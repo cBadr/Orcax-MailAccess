@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "app/api/verify/route.ts": { "maxDuration": 60 },
+    "app/api/extract/route.ts": { "maxDuration": 60 },
+    "app/api/upload-gofile/route.ts": { "maxDuration": 60 }
+  }
+}
