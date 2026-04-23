@@ -11,7 +11,7 @@
   "dependencies": {
     "imapflow": "^1.0.164",
     "mailparser": "^3.7.1",
-    "next": "14.2.15",
+    "next": "14.2.33",
     "nodemailer": "^6.9.15",
     "postgres": "^3.4.4",
     "react": "18.3.1",

@@ -33,7 +33,13 @@ export async function POST(req: NextRequest) {
     maxBodyScan: typeof maxBodyScan === "number" ? maxBodyScan : 100,
   });
   const cardPromise = includeCardDav
-    ? extractCardDav(email, password).catch((e: any) => ({ ok: false, error: String(e?.message || e), contacts: [], addressBooks: [] }))
+    ? extractCardDav(email, password).catch((e: any) => ({
+        ok: false as const,
+        error: String(e?.message || e),
+        contacts: [] as Awaited<ReturnType<typeof extractCardDav>>["contacts"],
+        addressBooks: [] as string[],
+        base: undefined as string | undefined,
+      }))
     : Promise.resolve(null);
 
   const [imapRes, cardRes] = await Promise.all([imapPromise, cardPromise]);
