@@ -100,6 +100,82 @@ export interface StoredMessage {
   body?: string;
 }
 
+// ---------- Jobs (queue) ----------
+
+export interface JobRow {
+  id: string;
+  kind: string;
+  status: string;
+  batch_id: string | null;
+  attempts: number;
+  result: unknown;
+  error: string | null;
+}
+
+export async function createJob(kind: "verify" | "send", payload: unknown, batchId?: string | null): Promise<string | null> {
+  if (!hasDb()) return null;
+  await ensureMigrated();
+  const s = sql();
+  const [row] = await s<{ id: string }[]>`
+    INSERT INTO jobs (kind, payload, batch_id)
+    VALUES (${kind}, ${s.json(payload as any)}, ${batchId ?? null})
+    RETURNING id
+  `;
+  return row.id;
+}
+
+export async function markJobQueued(jobId: string, messageId: string): Promise<void> {
+  if (!hasDb()) return;
+  const s = sql();
+  await s`UPDATE jobs SET message_id = ${messageId} WHERE id = ${jobId}`;
+}
+
+export async function markJobRunning(jobId: string): Promise<void> {
+  if (!hasDb()) return;
+  const s = sql();
+  await s`UPDATE jobs SET status = 'running', started_at = now(), attempts = attempts + 1 WHERE id = ${jobId}`;
+}
+
+export async function markJobDone(jobId: string, result: unknown): Promise<void> {
+  if (!hasDb()) return;
+  const s = sql();
+  await s`
+    UPDATE jobs
+    SET status = 'done', finished_at = now(), result = ${s.json(result as any)}
+    WHERE id = ${jobId}
+  `;
+}
+
+export async function markJobError(jobId: string, err: string): Promise<void> {
+  if (!hasDb()) return;
+  const s = sql();
+  await s`
+    UPDATE jobs SET status = 'error', finished_at = now(), error = ${err}
+    WHERE id = ${jobId}
+  `;
+}
+
+export async function jobStatus(jobId: string): Promise<JobRow | null> {
+  if (!hasDb()) return null;
+  const s = sql();
+  const rows = await s<JobRow[]>`
+    SELECT id, kind, status, batch_id, attempts, result, error
+    FROM jobs WHERE id = ${jobId}
+  `;
+  return rows[0] || null;
+}
+
+export async function batchJobSummary(batchId: string): Promise<{ queued: number; running: number; done: number; error: number }> {
+  if (!hasDb()) return { queued: 0, running: 0, done: 0, error: 0 };
+  const s = sql();
+  const rows = await s<{ status: string; n: number }[]>`
+    SELECT status, COUNT(*)::int AS n FROM jobs WHERE batch_id = ${batchId} GROUP BY status
+  `;
+  const out = { queued: 0, running: 0, done: 0, error: 0 } as Record<string, number>;
+  for (const r of rows) out[r.status] = r.n;
+  return out as any;
+}
+
 export async function recordMessages(accountId: string, msgs: StoredMessage[]): Promise<void> {
   if (!hasDb() || !msgs.length) return;
   const s = sql();

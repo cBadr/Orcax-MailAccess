@@ -167,4 +167,29 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_webhook ON webhook_deliveries(webhook_id, created_at DESC);
+
+-- Queued jobs (QStash). One row per enqueued account verify/send.
+CREATE TABLE IF NOT EXISTS jobs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  batch_id UUID REFERENCES batches(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,            -- verify | send
+  status TEXT NOT NULL DEFAULT 'queued', -- queued | running | done | error
+  payload JSONB NOT NULL,
+  result JSONB,
+  error TEXT,
+  attempts INT NOT NULL DEFAULT 0,
+  message_id TEXT,               -- QStash message id
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  started_at TIMESTAMPTZ,
+  finished_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id, status);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at DESC);
+
+-- Rate limiter hits (sliding window).
+CREATE TABLE IF NOT EXISTS rate_hits (
+  key TEXT NOT NULL,
+  at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_rate_hits_key_at ON rate_hits(key, at DESC);
 `;

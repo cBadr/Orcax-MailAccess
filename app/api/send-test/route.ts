@@ -5,6 +5,7 @@ import { sendTest } from "@/lib/smtp";
 import { audit, clientMeta } from "@/lib/audit";
 import { dispatch } from "@/lib/webhooks";
 import { publish } from "@/lib/events";
+import { check as rateCheck, headersFor, ipFrom } from "@/lib/ratelimit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,11 +14,24 @@ export const maxDuration = 60;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export async function POST(req: NextRequest) {
+  const ip = ipFrom(req);
+  const rl = await rateCheck({
+    key: "send:" + ip,
+    limit: Number(process.env.RATE_SEND_LIMIT) || 10,
+    windowSec: Number(process.env.RATE_SEND_WINDOW_SEC) || 60,
+  });
+  if (!rl.ok) {
+    return NextResponse.json(
+      { error: "rate_limited", retryAfterSec: rl.retryAfterSec, limit: rl.limit },
+      { status: 429, headers: headersFor(rl) },
+    );
+  }
+
   let body: any;
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "invalid json" }, { status: 400 });
+    return NextResponse.json({ error: "invalid json" }, { status: 400, headers: headersFor(rl) });
   }
   const { email, password, to, cc, bcc, subject, text, html, attachments, fromName, replyTo, trackingId, batchId } = body || {};
   if (typeof email !== "string" || typeof password !== "string") {
@@ -55,5 +69,5 @@ export async function POST(req: NextRequest) {
   await dispatch("send.completed", response).catch(() => {});
   await audit({ action: "send.done", target: email, details: { ok: result.ok, trackingId: tracking, messageId: result.messageId }, ...meta });
 
-  return NextResponse.json(response);
+  return NextResponse.json(response, { headers: headersFor(rl) });
 }

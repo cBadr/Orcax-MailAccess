@@ -150,6 +150,64 @@ npm run dev
 - Webhook signatures use HMAC-SHA256 with a per-webhook secret. Verify on the receiving side with `t=...,v1=...` split and a constant-time compare.
 - Only audit accounts you own or have explicit written permission to test.
 
+## Queue mode (QStash)
+
+For large lists, skip the per-account HTTP fanout from the browser. Instead:
+
+```
+POST /api/enqueue  { name, accounts: [{email,password}, ...], protocols? }
+  → { batchId, enqueued, failed, results: [...] }
+
+GET  /api/jobs/status?batchId=<id>     → { queued, running, done, error }
+GET  /api/jobs/status?jobId=<id>       → single job row
+GET  /api/stream?channel=<batchId>     → SSE live feed (check.completed events)
+```
+
+`/api/enqueue` creates a `batches` row, writes one `jobs` row per account, and publishes to **Upstash QStash**. QStash fans them back to `/api/jobs/verify` — one short invocation per account, so nothing hits Vercel's per-function timeout regardless of list size. The browser just polls `/api/jobs/status` or watches SSE.
+
+Required env:
+
+```
+QSTASH_TOKEN=...                     # publish token (Upstash console)
+QSTASH_CURRENT_SIGNING_KEY=...       # verify callbacks
+QSTASH_NEXT_SIGNING_KEY=...          # (rotation)
+APP_URL=https://your-app.vercel.app  # public URL QStash calls back
+DATABASE_URL=...                     # required for queue mode (persists jobs)
+```
+
+## Multi-instance pub/sub
+
+`lib/events.ts` auto-selects:
+- **Postgres `LISTEN/NOTIFY`** when `DATABASE_URL` is set — multiple lambdas stay in sync, so the SSE stream works no matter which instance received the publish.
+- **In-process Map** fallback when DB is absent (dev only).
+
+A self-ID on each publish prevents double-delivery to the publishing instance.
+
+> **Note**: `LISTEN/NOTIFY` needs a **session-mode** connection. If `DATABASE_URL` points to a transaction-pooled endpoint (Neon pooler `-pooler.neon`, Supabase `*pooler*:6543`), set `DATABASE_URL_DIRECT` to the direct-connection URL and use it for this module — or fall back to Upstash Redis pub/sub by replacing the backend in `lib/events.ts`.
+
+## Multi-threaded batch verify
+
+`POST /api/verify-batch { accounts: [...], concurrency?: 16 }` runs a bounded-concurrency pool over one request. Accounts are processed in parallel up to `concurrency`. Results stream in real time via `publish()` into the SSE channel while the request is still open.
+
+Set `WORKER_THREADS=1` (self-hosted / Docker, multi-vCPU) to spawn real `worker_threads` and spread the work across cores. On Vercel (single-vCPU lambdas) the async pool already saturates the event loop for I/O-bound verify, so threads add little there — the feature is available when you go beyond Vercel.
+
+Route caps:
+- `/api/verify-batch`: up to `VERIFY_BATCH_MAX` accounts (default 500), `maxDuration=300`.
+- `/api/enqueue`: up to `ENQUEUE_MAX_BATCH` accounts (default 10000).
+
+## Rate limiting
+
+Sliding-window limiter on every write endpoint:
+
+| Route | Env override (limit / windowSec) | Default |
+|-------|----------------------------------|---------|
+| `/api/verify` | `RATE_VERIFY_LIMIT` / `RATE_VERIFY_WINDOW_SEC` | 60 per 60s |
+| `/api/send-test` | `RATE_SEND_LIMIT` / `RATE_SEND_WINDOW_SEC` | 10 per 60s |
+| `/api/verify-batch` | `RATE_BATCH_LIMIT` / `RATE_BATCH_WINDOW_SEC` | 10 per 60s |
+| `/api/enqueue` | `RATE_ENQUEUE_LIMIT` / `RATE_ENQUEUE_WINDOW_SEC` | 5 per 60s |
+
+Backed by a `rate_hits` table (atomic CTE: trim + count + insert in one round trip), falls back to an in-memory Map if the DB is unreachable. Keys are per-IP (`x-forwarded-for`). Every response carries `x-ratelimit-*` headers; 429s include `retry-after`.
+
 ## Extending toward SaaS
 
 Clean seams:
