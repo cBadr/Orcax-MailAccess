@@ -20,8 +20,22 @@ export default function DashboardPage() {
   async function load() {
     try {
       const r = await fetch("/api/dashboard", { cache: "no-store" });
-      setData(await r.json());
-      setErr("");
+      const text = await r.text();
+      if (!text) {
+        setData({ enabled: false });
+        setErr(`Empty response (HTTP ${r.status})`);
+        return;
+      }
+      let j: any;
+      try {
+        j = JSON.parse(text);
+      } catch {
+        setData({ enabled: false });
+        setErr(`Non-JSON response (HTTP ${r.status}): ${text.slice(0, 200)}`);
+        return;
+      }
+      setData(j);
+      setErr(j?.error || "");
     } catch (e: any) {
       setErr(String(e?.message || e));
     }
@@ -47,7 +61,9 @@ export default function DashboardPage() {
       <div className="container">
         <h1>Dashboard</h1>
         <div className="card">
-          <p>Database not configured. Set <span className="mono">DATABASE_URL</span> in Vercel to enable analytics, audit log, webhooks, and full-text search.</p>
+          <p>Database not configured. Set <span className="mono">DATABASE_URL</span> in Vercel (or <span className="mono">.env.local</span>) to enable analytics, audit log, webhooks, and full-text search.</p>
+          {err ? <p className="error mono">{err}</p> : null}
+          <p><a href="/">← back to checker</a></p>
         </div>
       </div>
     );
